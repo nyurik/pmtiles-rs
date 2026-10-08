@@ -26,9 +26,18 @@ pub struct PmTilesWriter {
     internal_compressor: Box<dyn Compressor>,
 }
 
+#[derive(Clone, Copy)]
 struct TileContentLocation {
     offset: u64,
     length: u32,
+}
+
+/// What identifies a tile's content for deduplication: its hash, or a key the caller vouches for.
+/// Separate variants keep a caller's keys from colliding with content hashes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ContentKey {
+    Hash(u64),
+    Caller(u64),
 }
 
 /// `PMTiles` streaming writer.
@@ -36,6 +45,8 @@ pub struct PmTilesStreamWriter<W: Write + Seek> {
     state: WriterState<W>,
     tile_compressor: Box<dyn Compressor>,
     internal_compressor: Box<dyn Compressor>,
+    /// Metadata known only after the tiles, written at the end instead of the builder's.
+    late_metadata: Option<String>,
 }
 
 /// Separated from `PmTilesStreamWriter` so that internal methods can borrow
@@ -51,11 +62,13 @@ struct WriterState<W: Write + Seek> {
     /// The number of tile entries (not including directory entries) in this archive.
     n_tile_entries: u64,
 
-    /// A map of tile content locations by their hash.
-    /// Use `len()` to get `n_tile_contents`.
-    tile_content_map: HashMap<u64, TileContentLocation, BuildHasherDefault<XxHash3_64>>,
+    /// Locations of the tile contents that may repeat. Tiles added without a key are not remembered.
+    tile_content_map: HashMap<ContentKey, TileContentLocation, BuildHasherDefault<XxHash3_64>>,
 
-    prev_tile_hash: Option<u64>,
+    /// The number of distinct tile contents written.
+    n_tile_contents: u64,
+
+    prev_content: Option<ContentKey>,
     prev_written_tile_offset: u64,
 }
 
@@ -243,7 +256,8 @@ impl PmTilesWriter {
             n_addressed_tiles: 0,
             n_tile_entries: 0,
             tile_content_map: HashMap::default(),
-            prev_tile_hash: None,
+            n_tile_contents: 0,
+            prev_content: None,
             prev_written_tile_offset: 0,
         };
         state.header.metadata_length = metadata_length;
@@ -253,6 +267,7 @@ impl PmTilesWriter {
             state,
             tile_compressor: self.tile_compressor,
             internal_compressor: self.internal_compressor,
+            late_metadata: None,
         };
 
         Ok(writer)
@@ -288,6 +303,62 @@ impl<W: Write + Seek> PmTilesStreamWriter<W> {
         self.state
             .add_tile_by_id(coord.into(), data, &NoCompression)
     }
+
+    /// Replace the builder's metadata with one known only after the tiles, e.g. the layers and zooms a
+    /// generator produced. It is written after the tiles, and the header points at it.
+    pub fn set_metadata(&mut self, metadata: &str) {
+        self.late_metadata = Some(metadata.to_string());
+    }
+
+    /// Set the zoom range in the header, as [`PmTilesWriter::min_zoom`] and [`PmTilesWriter::max_zoom`]
+    /// do, once the tiles are known.
+    pub fn set_zoom_range(&mut self, min_zoom: u8, max_zoom: u8) {
+        self.state.header.min_zoom = min_zoom;
+        self.state.header.max_zoom = max_zoom;
+    }
+
+    /// Set the bounds in the header, as [`PmTilesWriter::bounds`] does, once the tiles are known.
+    pub fn set_bounds(&mut self, min_lon: f64, min_lat: f64, max_lon: f64, max_lat: f64) {
+        let header = &mut self.state.header;
+        (header.min_longitude, header.min_latitude) = (min_lon, min_lat);
+        (header.max_longitude, header.max_latitude) = (max_lon, max_lat);
+    }
+
+    /// Set the center in the header, as [`PmTilesWriter::center`] and [`PmTilesWriter::center_zoom`]
+    /// do, once the tiles are known.
+    pub fn set_center(&mut self, lon: f64, lat: f64, zoom: u8) {
+        let header = &mut self.state.header;
+        (
+            header.center_longitude,
+            header.center_latitude,
+            header.center_zoom,
+        ) = (lon, lat, zoom);
+    }
+
+    /// Add a pre-compressed tile whose duplicates the caller has already found.
+    ///
+    /// Unlike [`add_raw_tile`](Self::add_raw_tile), nothing is hashed. Tiles given the same `dedup`
+    /// key must have identical bytes: they are stored once, and consecutive ones as a single run.
+    /// A tile given `None` is stored as is and not remembered. The writer then keeps in memory only
+    /// the contents the caller expects to repeat, which matters for archives with hundreds of millions
+    /// of distinct tiles, and it never mistakes two different tiles with the same hash for one.
+    ///
+    /// # Errors
+    ///
+    /// If writing to the output stream fails
+    pub fn add_raw_tile_with_dedup(
+        &mut self,
+        coord: TileCoord,
+        data: &[u8],
+        dedup: Option<u64>,
+    ) -> PmtResult<()> {
+        self.state.add_tile(
+            coord.into(),
+            data,
+            dedup.map(ContentKey::Caller),
+            &NoCompression,
+        )
+    }
 }
 
 impl<W: Write + Seek> WriterState<W> {
@@ -306,15 +377,34 @@ impl<W: Write + Seek> WriterState<W> {
             return Ok(());
         }
 
-        let tile_id = tile_id.value();
-        let mut last_entry = self.entries.last_mut();
-        let tile_hash: u64 = XxHash3_64::oneshot(data);
+        self.add_tile(
+            tile_id,
+            data,
+            Some(ContentKey::Hash(XxHash3_64::oneshot(data))),
+            compressor,
+        )
+    }
 
+    /// Add a tile, deduplicated by `key` if given.
+    fn add_tile(
+        &mut self,
+        tile_id: TileId,
+        data: &[u8],
+        key: Option<ContentKey>,
+        compressor: &dyn Compressor,
+    ) -> PmtResult<()> {
+        if data.is_empty() {
+            // Ignore empty tiles, since the spec does not allow storing them
+            return Ok(());
+        }
+
+        let tile_id = tile_id.value();
         self.n_addressed_tiles += 1;
 
         // If the tile is identical to the previous one and the tile_id is consecutive, increase run_length
-        if let Some(ref mut last_entry) = last_entry {
-            if self.prev_tile_hash == Some(tile_hash)
+        if let Some(last_entry) = self.entries.last_mut() {
+            if key.is_some()
+                && self.prev_content == key
                 && tile_id == last_entry.tile_id + u64::from(last_entry.run_length)
             {
                 last_entry.run_length += 1;
@@ -327,19 +417,26 @@ impl<W: Write + Seek> WriterState<W> {
             }
         }
 
-        // Based on the tile hash, either get the existing location or write the tile data to the archive
-        let loc = match self.tile_content_map.entry(tile_hash) {
-            Entry::Occupied(e) => e.into_mut(),
-            Entry::Vacant(e) => {
+        // Either reuse the location of identical content, or write the tile data to the archive
+        let loc = match key.map(|key| self.tile_content_map.entry(key)) {
+            Some(Entry::Occupied(e)) => *e.get(),
+            slot => {
                 let offset = self.prev_written_tile_offset;
                 let len = data.write_compressed_to_counted(&mut self.out, compressor)?;
                 self.prev_written_tile_offset += len as u64;
-                let length = into_u32(len)?;
-                e.insert(TileContentLocation { offset, length })
+                self.n_tile_contents += 1;
+                let loc = TileContentLocation {
+                    offset,
+                    length: into_u32(len)?,
+                };
+                if let Some(Entry::Vacant(e)) = slot {
+                    e.insert(loc);
+                }
+                loc
             }
         };
 
-        self.prev_tile_hash = Some(tile_hash);
+        self.prev_content = key;
 
         self.n_tile_entries += 1;
         self.entries.push(DirEntry {
@@ -463,8 +560,16 @@ impl<W: Write + Seek> PmTilesStreamWriter<W> {
         // Write leaf directories and get a root directory
         let root_dir = state.build_directories(&self.internal_compressor)?;
 
+        if let Some(metadata) = &self.late_metadata {
+            state.header.metadata_offset = state.out.writer_bytes() as u64;
+            state.header.metadata_length = metadata
+                .as_bytes()
+                .write_compressed_to_counted(&mut state.out, &self.internal_compressor)?
+                as u64;
+        }
+
         state.header.n_addressed_tiles = state.n_addressed_tiles.try_into().ok();
-        state.header.n_tile_contents = (state.tile_content_map.len() as u64).try_into().ok();
+        state.header.n_tile_contents = state.n_tile_contents.try_into().ok();
         state.header.n_tile_entries = state.n_tile_entries.try_into().ok();
 
         // Determine compressed root directory length
@@ -507,6 +612,76 @@ mod tests {
     fn get_temp_file_path(suffix: &str) -> std::io::Result<String> {
         let temp_file = NamedTempFile::with_suffix(suffix)?;
         Ok(temp_file.path().to_string_lossy().into_owned())
+    }
+
+    #[tokio::test]
+    async fn metadata_and_zooms_set_after_the_tiles() {
+        let path = get_temp_file_path("pmtiles").unwrap();
+        let mut writer = PmTilesWriter::new(TileType::Mvt)
+            .metadata(r#"{"name":"early"}"#)
+            .create(File::create(&path).unwrap())
+            .unwrap();
+        for id in 0..300 {
+            let coord = TileId::new(id).unwrap().into();
+            writer
+                .add_raw_tile_with_dedup(coord, &id.to_le_bytes(), None)
+                .unwrap();
+        }
+        writer.set_metadata(r#"{"name":"late"}"#);
+        writer.set_zoom_range(1, 7);
+        writer.set_bounds(-10.0, -20.0, 30.0, 40.0);
+        writer.set_center(1.0, 2.0, 3);
+        writer.finalize().unwrap();
+
+        let backend = MmapBackend::try_from(&path).await.unwrap();
+        let reader = AsyncPmTilesReader::try_from_source(backend).await.unwrap();
+        assert_eq!(reader.get_metadata().await.unwrap(), r#"{"name":"late"}"#);
+        let header = reader.get_header();
+        assert_eq!(
+            (header.min_zoom, header.max_zoom, header.center_zoom),
+            (1, 7, 3)
+        );
+        assert_eq!((header.min_longitude, header.max_latitude), (-10.0, 40.0));
+        assert_eq!(
+            reader
+                .get_tile(TileId::new(299).unwrap())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(&299u64.to_le_bytes()[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn caller_dedup_keys_store_keyed_tiles_once() {
+        let path = get_temp_file_path("pmtiles").unwrap();
+        let mut writer = PmTilesWriter::new(TileType::Mvt)
+            .create(File::create(&path).unwrap())
+            .unwrap();
+        let tiles: [(&[u8], Option<u64>); 6] = [
+            (b"root", None),
+            (b"fill", Some(7)),
+            (b"fill", Some(7)), // extends the previous run
+            (b"other", None),
+            (b"fill", Some(7)), // reuses the stored content in a new entry
+            (b"other", None),   // unkeyed, so stored again
+        ];
+        for (id, (data, dedup)) in (0..).zip(tiles) {
+            let coord = TileId::new(id).unwrap().into();
+            writer.add_raw_tile_with_dedup(coord, data, dedup).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let backend = MmapBackend::try_from(&path).await.unwrap();
+        let reader = AsyncPmTilesReader::try_from_source(backend).await.unwrap();
+        let header = reader.get_header();
+        assert_eq!(header.n_addressed_tiles, NonZeroU64::new(6));
+        assert_eq!(header.n_tile_entries, NonZeroU64::new(5));
+        assert_eq!(header.n_tile_contents, NonZeroU64::new(4));
+        for (id, (data, _)) in (0..).zip(tiles) {
+            let tile = reader.get_tile(TileId::new(id).unwrap()).await.unwrap();
+            assert_eq!(tile.as_deref(), Some(data), "tile {id}");
+        }
     }
 
     #[tokio::test]
@@ -627,6 +802,12 @@ mod tests {
     async fn with_leaves() {
         let path = gen_entries(20000);
         verify_entries(&path, 20000).await;
+    }
+
+    #[test]
+    fn writer_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<super::PmTilesStreamWriter<File>>();
     }
 
     #[test]
