@@ -32,11 +32,12 @@ struct TileContentLocation {
     length: u32,
 }
 
-/// What identifies a tile's content for deduplication: its hash, or a key the caller vouches for.
-/// Separate variants keep a caller's keys from colliding with content hashes.
+/// What identifies a tile's content for deduplication
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ContentKey {
+    /// Hash identifies tile content, but neeeds to be checked against tile content to prevent collisions
     Hash(u64),
+    /// Caller has ensured this is an unique identifier for the content
     Caller(u64),
 }
 
